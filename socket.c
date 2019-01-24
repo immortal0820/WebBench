@@ -36,6 +36,7 @@ int Socket(const char *host, int clientPort)
     memset(&ad, 0, sizeof(ad));
     ad.sin_family = AF_INET;
 
+	// 转化为网络字节序地址
     inaddr = inet_addr(host);
     if (inaddr != INADDR_NONE)
         memcpy(&ad.sin_addr, &inaddr, sizeof(inaddr));

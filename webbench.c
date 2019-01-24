@@ -154,6 +154,11 @@ int main(int argc, char *argv[])
         }
     }
 
+	/* optind 标识下一个选项的索引
+	 * optarg not contain url
+	 * exp: webbench --get, argc = 2, optind = 2, so missing url
+	 * exp: webbench --get http://xxx, argc = 3, optind = 2, so no missing url
+	 */
     if(optind==argc) {
         fprintf(stderr,"webbench: Missing URL!\n");
         usage();
@@ -161,7 +166,7 @@ int main(int argc, char *argv[])
     }
 
     if(clients==0) clients=1;
-    if(benchtime==0) benchtime=30;
+    if(benchtime==0) benchtime=60;
  
     /* Copyright */
     fprintf(stderr,"Webbench - Simple Web Benchmark "PROGRAM_VERSION"\n"
@@ -258,7 +263,7 @@ void build_request(const char *url)
     }
     
     /* protocol/host delimiter */
-    i=strstr(url,"://")-url+3;
+    i=strstr(url,"://")-url+3;  // exp: http://www.baidu.com/ i = 7
 
     if(strchr(url+i,'/')==NULL) {
         fprintf(stderr,"\nInvalid URL syntax - hostname don't ends with '/'.\n");
@@ -298,7 +303,7 @@ void build_request(const char *url)
   
     strcat(request,"\r\n");
   
-    if(http10>0)
+    if(http10>0) // HTTP/1.0 HTTP/1.1
         strcat(request,"User-Agent: WebBench "PROGRAM_VERSION"\r\n");
     if(proxyhost==NULL && http10>0)
     {
@@ -312,7 +317,7 @@ void build_request(const char *url)
         strcat(request,"Pragma: no-cache\r\n");
     }
   
-    if(http10>1)
+    if(http10>1)	// HTTP/1.1
         strcat(request,"Connection: close\r\n");
     
     /* add empty line at end */
@@ -328,7 +333,7 @@ static int bench(void)
     pid_t pid=0;
     FILE *f;
 
-    /* check avaibility of target server */
+    /* check avaibility of target server 测试远程主机是否能够连通 */
     i=Socket(proxyhost==NULL?host:proxyhost,proxyport);
     if(i<0) { 
         fprintf(stderr,"\nConnect to server failed. Aborting benchmark.\n");
@@ -357,9 +362,9 @@ static int bench(void)
         pid=fork();
         if(pid <= (pid_t) 0)
         {
-            /* child process or error*/
-            sleep(1); /* make childs faster */
-            break;
+            /* child process or error */
+            sleep(1); /* make childs faster, child sleep(1) */
+            break; /* child 跳出循环, or fork 出错父进程跳出循环 */
         }
     }
 
@@ -372,6 +377,7 @@ static int bench(void)
 
     if(pid == (pid_t) 0)
     {
+		close(mypipe[0]);
         /* I am a child */
         if(proxyhost==NULL)
             benchcore(host,proxyport,request);
@@ -386,13 +392,16 @@ static int bench(void)
             return 3;
         }
         /* fprintf(stderr,"Child - %d %d\n",speed,failed); */
+		/* 子进程将speed failed bytes写进管道 */
         fprintf(f,"%d %d %d\n",speed,failed,bytes);
         fclose(f);
 
+		// 子进程完成任务，返回退出
         return 0;
     } 
     else
     {
+		close(mypipe[1]);
         f=fdopen(mypipe[0],"r");
         if(f==NULL) 
         {
@@ -400,8 +409,10 @@ static int bench(void)
             return 3;
         }
         
+		// _IONBF(无缓冲): 直接从流中读入数据或直接向流中写入数据, 而没有缓冲区
         setvbuf(f,NULL,_IONBF,0);
         
+		// 虽然子进程不能污染父进程的这几个变量, 但使用前重置一下
         speed=0;
         failed=0;
         bytes=0;
@@ -435,6 +446,10 @@ static int bench(void)
     return i;
 }
 
+/*
+ *	Function: benchore
+ *	Description: child process bench, called of each child process
+ */
 void benchcore(const char *host,const int port,const char *req)
 {
     int rlen;
@@ -443,17 +458,23 @@ void benchcore(const char *host,const int port,const char *req)
     struct sigaction sa;
 
     /* setup alarm signal handler */
+	// 当程序执行到指定的秒数后, 发送SIGALRM信号, 即设置alarm_handler为信号处理函数
     sa.sa_handler=alarm_handler;
     sa.sa_flags=0;
+
+	// 成功返回0, 失败返回-1, 超时会产生信号SIGALRM, 用sa指定函数处理
     if(sigaction(SIGALRM,&sa,NULL))
         exit(3);
     
+	// 开始计时
     alarm(benchtime); // after benchtime,then exit
 
     rlen=strlen(req);
-    nexttry:while(1)
-    {
-        if(timerexpired)
+
+	// 无限执行请求，直到收到SIGALRM信号将timerexpired置为1
+nexttry:
+	while(1) {
+        if(timerexpired)  // 超时返回
         {
             if(failed>0)
             {
@@ -463,31 +484,43 @@ void benchcore(const char *host,const int port,const char *req)
             return;
         }
         
-        s=Socket(host,port);                          
-        if(s<0) { failed++;continue;} 
-        if(rlen!=write(s,req,rlen)) {failed++;close(s);continue;}
-        if(http10==0) 
-        if(shutdown(s,1)) { failed++;close(s);continue;}
-        if(force==0) 
-        {
-            /* read all available data from socket */
-            while(1)
-            {
-                if(timerexpired) break; 
-                i=read(s,buf,1500);
-                /* fprintf(stderr,"%d\n",i); */
-                if(i<0) 
-                { 
-                    failed++;
-                    close(s);
-                    goto nexttry;
-                }
-                else
-                if(i==0) break;
-                else
-                bytes+=i;
-            }
-        }
+		s=Socket(host,port);                          
+		if(s<0) { 
+			failed++;	// 连接失败, failed加1
+			continue;
+		} 
+		if(rlen!=write(s,req,rlen)) {  // 发送请求, header大小与发送的不相等，则失败
+			failed++;
+			close(s);
+			continue;
+		}
+		if(http10==0) {   // 针对http 0.9做的特殊处理, 则关闭socket的写操作, 成功返回0, 错误返回-1
+			if(shutdown(s,1)) { 
+				failed++;
+				close(s);
+				continue;
+			}
+		}
+		if(force==0) 
+		{
+			/* read all available data from socket */
+			while(1)
+			{
+				if(timerexpired) break; 
+				i=read(s,buf,1500);
+				/* fprintf(stderr,"%d\n",i); */
+				if(i<0) 
+				{ 
+					failed++;
+					close(s);
+					goto nexttry;
+				}
+				else
+					if(i==0) break;
+					else
+						bytes+=i;
+			}
+		}
         if(close(s)) {failed++;continue;}
         speed++;
     }
